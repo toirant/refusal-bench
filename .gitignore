@@ -2,7 +2,15 @@
 __pycache__/
 *.pyc
 results.jsonl
+results_v2.jsonl
 judgments.jsonl
+judgments_v2.jsonl
 handcheck_sample.csv
+handcheck_sample_v2.csv
 summary.json
+summary_v2.json
 charts/*.png
+charts_v2/*.png
+*.log
+*.bak
+judgments.corrupt.bak
