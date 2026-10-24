@@ -1,0 +1,30 @@
+# Prices in USD per 1M tokens. Marked TODO-verify — replace with live pricing.
+# cost_per_1k_prompts uses average tokens from a run; placeholders are for planning.
+currency: USD
+unit: per_1M_tokens
+
+models:
+  openai/gpt-4o-mini:
+    input: 0.15   # TODO-verify
+    output: 0.60  # TODO-verify
+  anthropic/claude-3-5-haiku-latest:
+    input: 0.80   # TODO-verify
+    output: 4.00  # TODO-verify
+  gemini/gemini-2.0-flash:
+    input: 0.10   # TODO-verify
+    output: 0.40  # TODO-verify
+  xai/grok-2-latest:
+    input: 2.00   # TODO-verify
+    output: 10.00 # TODO-verify
+  mistral/mistral-small-latest:
+    input: 0.20   # TODO-verify
+    output: 0.60  # TODO-verify
+  nosana/meta-llama/Meta-Llama-3.1-8B-Instruct:
+    input: 0.05   # TODO-verify — Nosana marketplace pricing varies by GPU
+    output: 0.05  # TODO-verify
+  nosana_self/Qwen/Qwen2.5-7B-Instruct:
+    input: 0.00   # self-hosted GPU rental; attribute job cost separately
+    output: 0.00
+
+# Approximate GPU rental for self-deploy (Nosana job), USD per hour — TODO-verify
+nosana_self_gpu_usd_per_hour: 0.50
