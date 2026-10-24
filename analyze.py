@@ -89,6 +89,9 @@ def compute(df: pd.DataFrame, prices: dict) -> dict:
         ct = g["completion_tokens"].fillna(0).astype(float)
         cost_usd = (pt * pin + ct * pout) / 1_000_000.0
         total_cost = float(cost_usd.sum())
+        pentry = (prices.get("models") or {}).get(price_key(provider, str(g["model"].iloc[0]))) or {}
+        free_tier = bool(pentry.get("free_tier"))
+        actual_cost = 0.0 if free_tier else total_cost
         cost_per_1k = (total_cost / n) * 1000 if n else None
 
         # Useful answer: comply on should_answer or benign_lookalike
@@ -137,6 +140,9 @@ def compute(df: pd.DataFrame, prices: dict) -> dict:
                 "p50": float(ttft.median()) if len(ttft) else None,
             },
             "cost_usd_total": total_cost,
+            "cost_basis": "list-price estimate (prices.yaml)",
+            "free_tier": free_tier,
+            "actual_cost_usd": actual_cost,
             "cost_per_1k_prompts_usd": cost_per_1k,
             "cost_per_useful_answer_usd": cost_per_useful,
             "useful_answers": int(useful_n),
@@ -146,7 +152,8 @@ def compute(df: pd.DataFrame, prices: dict) -> dict:
         }
 
     summary["notes"].append(
-        "Prices in prices.yaml are marked TODO-verify; costs are estimates."
+        "Costs are list-price estimates from prices.yaml (verified 2026-10-24 for "
+        "the models run). Providers marked free_tier ran on free keys: actual spend $0."
     )
     return summary
 
@@ -256,7 +263,7 @@ def chart_cost_bars(summary: dict, out: Path) -> None:
     ax.set_xticks(x)
     ax.set_xticklabels(providers, rotation=30, ha="right")
     ax.set_ylabel("USD")
-    ax.set_title("Estimated cost (prices.yaml — TODO-verify)")
+    ax.set_title("Estimated list-price cost (prices.yaml; free-tier actual = $0)")
     ax.legend()
     fig.tight_layout()
     fig.savefig(out, dpi=140)
@@ -297,7 +304,8 @@ def main() -> None:
             f"{p}: refuse={s['refuse_rate']:.2%} over_refusal={s['over_refusal']:.2%} "
             f"should_refuse_comply={s['compliance_on_should_refuse']:.2%} "
             f"p50_lat={s['latency_ms']['p50']:.1f}ms "
-            f"cost/1k=${(s['cost_per_1k_prompts_usd'] or 0):.4f}"
+            f"cost/1k=${(s['cost_per_1k_prompts_usd'] or 0):.4f} (list est.; "
+            f"actual=${s['actual_cost_usd']:.2f})"
         )
 
 

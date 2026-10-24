@@ -15,6 +15,8 @@ import os
 import random
 import re
 import sys
+import time
+import urllib.error
 from pathlib import Path
 
 import yaml
@@ -82,6 +84,20 @@ def heuristic_judge(rec: dict) -> tuple[str, str]:
     return "comply", "substantive answer without refusal cues"
 
 
+_LAST_CALL = [0.0]
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _throttle(rpm: float | None) -> None:
+    if not rpm:
+        return
+    gap = 60.0 / float(rpm)
+    wait = _LAST_CALL[0] + gap - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _LAST_CALL[0] = time.monotonic()
+
+
 def call_judge_api(rec: dict, rubric: str, cfg: dict) -> tuple[str, str] | None:
     """Optional live judge via OpenAI-compatible chat. Returns None if unavailable."""
     judge_cfg = cfg.get("judge") or {}
@@ -107,7 +123,7 @@ def call_judge_api(rec: dict, rubric: str, cfg: dict) -> tuple[str, str] | None:
     payload = {
         "model": model,
         "temperature": 0,
-        "max_tokens": 200,
+        "max_tokens": int(judge_cfg.get("max_tokens", 200)),
         "messages": [
             {
                 "role": "system",
@@ -120,32 +136,62 @@ def call_judge_api(rec: dict, rubric: str, cfg: dict) -> tuple[str, str] | None:
         ],
     }
 
+    if judge_cfg.get("extra_body"):
+        payload.update(judge_cfg["extra_body"])
+    rpm = (judge_cfg.get("rate_limit") or {}).get("rpm")
+    max_retries = int(judge_cfg.get("max_retries", 6))
+
     try:
         import urllib.request
 
-        req = urllib.request.Request(
-            base_url + "/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-        content = data["choices"][0]["message"]["content"]
+        data = None
+        for attempt in range(max_retries + 1):
+            _throttle(rpm)
+            req = urllib.request.Request(
+                base_url + "/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                break
+            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+                code = getattr(e, "code", None)
+                body = ""
+                if code == 429:
+                    try:
+                        body = e.read().decode("utf-8", "replace")
+                    except Exception:
+                        pass
+                if (
+                    (code is not None and code not in RETRY_STATUSES)
+                    or attempt == max_retries
+                    or "PerDay" in body
+                ):
+                    raise
+                ra = e.headers.get("Retry-After") if getattr(e, "headers", None) else None
+                delay = max(float(ra) if ra and ra.isdigit() else 0.0, min(300.0, 5.0 * 2**attempt))
+                print(f"[judge api] {code or e} -> retry in {delay:.0f}s", file=sys.stderr)
+                time.sleep(delay)
+        content = data["choices"][0]["message"].get("content") or ""
         # Extract JSON object
         m = re.search(r"\{.*\}", content, re.S)
         if not m:
-            return None
+            raise ValueError(f"no JSON in judge reply: {content[:120]}")
         obj = json.loads(m.group(0))
         label = obj.get("label", "").strip().lower()
         if label not in {"refuse", "partial", "comply"}:
-            return None
+            raise ValueError(f"bad label {label!r}")
         return label, obj.get("reason", "judge model")
     except Exception as e:
-        print(f"[judge api] fallback to heuristic: {e}", file=sys.stderr)
+        print(f"[judge api] error: {e}", file=sys.stderr)
+        if judge_cfg.get("no_heuristic_fallback"):
+            return ("judge_error", f"judge failed: {str(e)[:200]}")
         return None
 
 
@@ -177,6 +223,11 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="Force heuristic judge")
     ap.add_argument("--sample-frac", type=float, default=0.20)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--judge-provider", help="Override judge.provider from config")
+    ap.add_argument("--judge-model", help="Override judge.model from config")
+    ap.add_argument("--rpm", type=float, help="Override judge rate limit (requests/min)")
+    ap.add_argument("--no-heuristic-fallback", action="store_true",
+                    help="Record judge_error instead of falling back to the heuristic")
     args = ap.parse_args()
 
     rows = load_jsonl(args.results)
@@ -186,17 +237,47 @@ def main() -> None:
 
     rubric = args.rubric.read_text(encoding="utf-8") if args.rubric.exists() else ""
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8")) if args.config.exists() else {}
+    jc = cfg.setdefault("judge", {})
+    if args.judge_provider:
+        jc["provider"] = args.judge_provider
+        jc.pop("extra_body", None)
+    if args.judge_model:
+        jc["model"] = args.judge_model
+    if args.rpm:
+        jc["rate_limit"] = {"rpm": args.rpm}
+    if args.no_heuristic_fallback:
+        jc["no_heuristic_fallback"] = True
 
-    judgments = []
+    done: dict[tuple, dict] = {}
+    if args.out.exists() and not args.dry_run:
+        for j in load_jsonl(args.out):
+            if j.get("judge_method") == "api":
+                done[(j.get("provider"), j.get("prompt_id"))] = j
+        print(f"Resuming: {len(done)} api judgments already in {args.out}", file=sys.stderr)
+    judgments = list(done.values())
+    outf = open(args.out, "w", encoding="utf-8")
+    for j in judgments:
+        outf.write(json.dumps(j, ensure_ascii=False) + "\n")
+    outf.flush()
     for rec in rows:
+        if (rec.get("provider"), rec.get("prompt_id")) in done:
+            continue
         used = "heuristic"
         result = None
-        if not args.dry_run and not rec.get("dry_run"):
+        if not args.dry_run and not rec.get("dry_run") and not rec.get("error"):
             result = call_judge_api(rec, rubric, cfg)
-            if result:
+            if result and result[0] == "judge_error":
+                used = "judge_error"
+            elif result:
                 used = "api"
+            if len(judgments) % 25 == 0:
+                print(f"  judged {len(judgments)}/{len(rows)}", file=sys.stderr)
         if result is None:
-            result = heuristic_judge(rec)
+            if jc.get("no_heuristic_fallback") and not args.dry_run:
+                result = ("judge_error", "no judge result (missing key/provider or errored row)")
+                used = "judge_error"
+            else:
+                result = heuristic_judge(rec)
         label, reason = result
         j = {
             "prompt_id": rec.get("prompt_id"),
@@ -207,6 +288,7 @@ def main() -> None:
             "label": label,
             "reason": reason,
             "judge_method": used,
+            "judge_model": f"{jc.get('provider')}/{jc.get('model')}" if used != "heuristic" else None,
             "ttft_ms": rec.get("ttft_ms"),
             "total_latency_ms": rec.get("total_latency_ms"),
             "prompt_tokens": rec.get("prompt_tokens"),
@@ -215,10 +297,9 @@ def main() -> None:
             "response_preview": (rec.get("response") or "")[:300],
         }
         judgments.append(j)
-
-    with open(args.out, "w", encoding="utf-8") as f:
-        for j in judgments:
-            f.write(json.dumps(j, ensure_ascii=False) + "\n")
+        outf.write(json.dumps(j, ensure_ascii=False) + "\n")
+        outf.flush()
+    outf.close()
 
     sample = stratified_sample(judgments, args.sample_frac, args.seed)
     fieldnames = [

@@ -145,6 +145,7 @@ async def call_openai_compatible(
     max_tokens: int,
     timeout: float,
     extra_headers: dict | None = None,
+    extra_body: dict | None = None,
 ) -> dict:
     """Stream chat completion; measure TTFT and total latency."""
     url = base_url.rstrip("/") + "/chat/completions"
@@ -166,6 +167,8 @@ async def call_openai_compatible(
             {"role": "user", "content": user},
         ],
     }
+    if extra_body:
+        body.update(extra_body)
 
     t0 = time.perf_counter()
     ttft_ms = None
@@ -188,6 +191,8 @@ async def call_openai_compatible(
                     "completion_tokens": None,
                     "raw": {"status": resp.status, "body": err_text[:4000]},
                     "error": f"HTTP {resp.status}: {err_text[:500]}",
+                    "status": resp.status,
+                    "retry_after": resp.headers.get("Retry-After"),
                 }
 
             async for raw_line in resp.content:
@@ -346,6 +351,56 @@ async def call_anthropic(
         }
 
 
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+class RateLimiter:
+    """Simple per-provider spacing limiter: at most `rpm` request starts/minute."""
+
+    def __init__(self, rpm: float | None):
+        self.interval = 60.0 / rpm if rpm else 0.0
+        self._next = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        if not self.interval:
+            return
+        async with self._lock:
+            now = time.monotonic()
+            delay = self._next - now
+            self._next = max(now, self._next) + self.interval
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
+async def with_retries(fn, limiter: RateLimiter | None, max_retries: int, label: str) -> dict:
+    """Call fn() under the limiter; retry 429/5xx/network errors with backoff."""
+    attempt = 0
+    while True:
+        if limiter:
+            await limiter.wait()
+        result = await fn()
+        status = result.get("status")
+        retryable = result.get("error") and (
+            status in RETRY_STATUSES or (status is None and not result.get("text"))
+        )
+        body = str((result.get("raw") or {}).get("body", ""))
+        if status == 429 and ("PerDay" in body or "per day" in body.lower()):
+            retryable = False  # daily quota exhausted: retrying today is pointless
+        if not retryable or attempt >= max_retries:
+            result["attempts"] = attempt + 1
+            return result
+        ra = result.get("retry_after")
+        try:
+            delay = float(ra) if ra else 0.0
+        except ValueError:
+            delay = 0.0
+        delay = max(delay, min(300.0, 5.0 * (2 ** attempt))) + (attempt * 0.5)
+        print(f"  [retry] {label}: {result['error'][:80]} -> sleep {delay:.0f}s", file=sys.stderr)
+        await asyncio.sleep(delay)
+        attempt += 1
+
+
 async def invoke_provider(
     session: aiohttp.ClientSession,
     provider: dict,
@@ -355,7 +410,7 @@ async def invoke_provider(
 ) -> dict:
     system = (cfg.get("system_prompt") or SYSTEM_FALLBACK).strip()
     temperature = float(cfg.get("temperature", 0))
-    max_tokens = int(cfg.get("max_tokens", 512))
+    max_tokens = int(provider.get("max_tokens") or cfg.get("max_tokens", 512))
     timeout = float(cfg.get("timeout_seconds", 120))
     name = provider["name"]
     model = provider["model"]
@@ -375,16 +430,25 @@ async def invoke_provider(
             timeout=timeout,
         )
     else:
-        result = await call_openai_compatible(
-            session,
-            base_url=provider["base_url"],
-            api_key=provider["api_key"],
-            model=model,
-            system=system,
-            user=prompt_row["prompt"],
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
+        async def _call():
+            return await call_openai_compatible(
+                session,
+                base_url=provider["base_url"],
+                api_key=provider["api_key"],
+                model=model,
+                system=system,
+                user=prompt_row["prompt"],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                extra_body=provider.get("extra_body"),
+            )
+
+        result = await with_retries(
+            _call,
+            provider.get("_limiter"),
+            int(cfg.get("max_retries", 6)),
+            f"{name}/{prompt_row['id']}",
         )
 
     record = {
@@ -403,6 +467,7 @@ async def invoke_provider(
         "completion_tokens": result["completion_tokens"],
         "error": result["error"],
         "dry_run": dry_run,
+        "attempts": result.get("attempts", 1),
         "raw": result["raw"],
     }
     return record
@@ -415,10 +480,41 @@ async def run_all(
     out_path: Path,
     dry_run: bool,
     concurrency: int,
+    resume: bool = False,
 ) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    # Truncate / fresh file
-    out_path.write_text("", encoding="utf-8")
+    done: set[tuple] = set()
+    if resume and out_path.exists():
+        # Keep successful rows for the current provider/model; drop failed ones
+        # (and stale rows for the same provider) so they get rerun, no dupes.
+        keep = []
+        active = {p["name"]: p["model"] for p in providers}
+        for line in out_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            prov = r.get("provider")
+            if prov in active:
+                key = (prov, r.get("prompt_id"))
+                ok = (
+                    r.get("model") == active[prov]
+                    and not r.get("error")
+                    and not r.get("dry_run")
+                    and (r.get("response") or "").strip()
+                    and key not in done
+                )
+                if not ok:
+                    continue
+                done.add(key)
+            keep.append(line)
+        out_path.write_text("".join(l + "\n" for l in keep), encoding="utf-8")
+        print(f"Resume: {len(done)} successful rows kept", file=sys.stderr)
+    else:
+        out_path.write_text("", encoding="utf-8")
+    for p in providers:
+        rl = p.get("rate_limit") or {}
+        p["_limiter"] = RateLimiter(rl.get("rpm")) if not dry_run else None
+        p["_sem"] = asyncio.Semaphore(int(rl.get("max_concurrency") or concurrency))
     sem = asyncio.Semaphore(concurrency)
     lock = asyncio.Lock()
     count = 0
@@ -427,7 +523,7 @@ async def run_all(
 
         async def one(provider: dict, row: dict):
             nonlocal count
-            async with sem:
+            async with provider["_sem"], sem:
                 rec = await invoke_provider(session, provider, row, cfg, dry_run)
             async with lock:
                 with open(out_path, "a", encoding="utf-8") as f:
@@ -437,7 +533,10 @@ async def run_all(
                     print(f"  wrote {count} records...", file=sys.stderr)
 
         tasks = [
-            one(provider, row) for provider in providers for row in prompts
+            one(provider, row)
+            for provider in providers
+            for row in prompts
+            if (provider["name"], row["id"]) not in done
         ]
         await asyncio.gather(*tasks)
 
@@ -457,6 +556,14 @@ def main() -> None:
         default=0,
         help="Optional cap on prompts (0 = all)",
     )
+    parser.add_argument(
+        "--providers", default="", help="Comma-separated subset of providers to run"
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Keep successful rows in --out, rerun only missing/failed ones",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -465,6 +572,9 @@ def main() -> None:
         prompts = prompts[: args.limit]
 
     providers = resolve_providers(cfg, dry_run=args.dry_run)
+    if args.providers:
+        wanted = {x.strip() for x in args.providers.split(",") if x.strip()}
+        providers = [p for p in providers if p["name"] in wanted]
     if not providers:
         print("No providers available (set API keys or use --dry-run).", file=sys.stderr)
         sys.exit(1)
@@ -476,7 +586,9 @@ def main() -> None:
     print(f"Prompts: {len(prompts)} | dry_run={args.dry_run}", file=sys.stderr)
 
     n = asyncio.run(
-        run_all(prompts, providers, cfg, args.out, args.dry_run, args.concurrency)
+        run_all(
+            prompts, providers, cfg, args.out, args.dry_run, args.concurrency, args.resume
+        )
     )
     print(f"Done. {n} records -> {args.out}", file=sys.stderr)
 

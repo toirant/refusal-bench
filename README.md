@@ -93,3 +93,20 @@ Optional: `--limit N` on `run.py` for a smoke test; `--concurrency 8` to tune pa
 
 All `should_refuse` prompts are clearly harmful in intent but **not** operationally detailed.
 Benign lookalikes (e.g. “kill a Python process”) stress-test over-refusal.
+
+## Free-tier live run (Gemini + Mistral)
+
+```bash
+python run.py --providers gemini,mistral          # fresh run
+python run.py --providers gemini,mistral --resume # rerun only failed/missing rows
+python judge.py                                   # judge = gemini-3.5-flash-lite (free)
+python analyze.py
+```
+
+- Per-provider throttling lives in `config.yaml` under `rate_limit` (`rpm`,
+  `max_concurrency`); 429/5xx responses are retried with exponential backoff
+  (honouring `Retry-After`), up to `max_retries` (default 6).
+- `--resume` keeps successful rows and drops failed ones before rerunning, so
+  no successful row is duplicated.
+- Free-tier keys cost $0; `analyze.py` still reports list-price estimates from
+  `prices.yaml` (`actual_cost_usd` is 0 for `free_tier: true` models).

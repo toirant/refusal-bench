@@ -1,4 +1,8 @@
-# Prices in USD per 1M tokens. Marked TODO-verify — replace with live pricing.
+# Prices in USD per 1M tokens (paid-tier list prices, standard / non-batch).
+# Entries marked "verified" were checked on the official pricing pages on 2026-10-24.
+# Others remain TODO-verify (not used in the current run).
+# free_tier: true means the run used a free-tier key, so actual spend is $0;
+# analyze.py still reports the list-price estimate for comparison.
 # cost_per_1k_prompts uses average tokens from a run; placeholders are for planning.
 currency: USD
 unit: per_1M_tokens
@@ -10,15 +14,36 @@ models:
   anthropic/claude-3-5-haiku-latest:
     input: 0.80   # TODO-verify
     output: 4.00  # TODO-verify
-  gemini/gemini-2.0-flash:
-    input: 0.10   # TODO-verify
-    output: 0.40  # TODO-verify
+  gemini/gemini-3.8-flash:
+    # verified https://ai.google.dev/gemini-api/docs/pricing (text, standard tier)
+    # $0.75 / $3.75 through 2026-12-31; $1.50 / $7.50 from 2027-01-01.
+    # Output price includes thinking tokens.
+    input: 0.75
+    output: 3.75
+    free_tier: true   # only 20 req/day on free tier; not used for the run
+  gemini/gemini-3.5-flash-lite:
+    # model used for the gemini run; verified same page (standard tier)
+    input: 0.30
+    output: 2.50
+    free_tier: true
+  gemini/gemini-3.1-flash-lite:
+    # judge model; verified same page (standard tier, text)
+    input: 0.25
+    output: 1.50
+    free_tier: true
   xai/grok-2-latest:
     input: 2.00   # TODO-verify
     output: 10.00 # TODO-verify
+  mistral/ministral-14b-latest:
+    # verified https://docs.mistral.ai/models/ministral-3-14b-25-12 (Ministral 3 14B)
+    input: 0.20
+    output: 0.20
+    free_tier: true
   mistral/mistral-small-latest:
-    input: 0.20   # TODO-verify
-    output: 0.60  # TODO-verify
+    # verified https://docs.mistral.ai/models/mistral-small-4-0-26-03 (Mistral Small 4);
+    # not runnable on the free key (0 req/min quota)
+    input: 0.15
+    output: 0.60
   nosana/meta-llama/Meta-Llama-3.1-8B-Instruct:
     input: 0.05   # TODO-verify — Nosana marketplace pricing varies by GPU
     output: 0.05  # TODO-verify

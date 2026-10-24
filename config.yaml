@@ -22,7 +22,22 @@ providers:
   gemini:
     env_key: GEMINI_API_KEY
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
-    model: gemini-2.0-flash
+    # Verified 2026-10-24: gemini-2.0/2.5-flash are "no longer available to new
+    # users". gemini-3.8-flash is free but its free tier is 5 RPM / 20 requests
+    # per day (429 GenerateRequestsPerDayPerProjectPerModel-FreeTier, limit 20),
+    # too few for 142 prompts. gemini-3.5-flash-lite is free at 15 RPM / 500 RPD.
+    model: gemini-3.5-flash-lite
+    free_tier: true
+    # Gemini 3.x always thinks; thinking tokens count against max_tokens, so
+    # use low effort and a larger output budget to avoid empty answers.
+    max_tokens: 2048
+    extra_body:
+      reasoning_effort: low
+    # Free-tier limits are per project and only shown in AI Studio; stay well
+    # under the documented free Flash limits.
+    rate_limit:
+      rpm: 10          # free tier: 15 RPM, 500 RPD per project per model
+      max_concurrency: 2
   xai:
     env_key: XAI_API_KEY
     base_url: https://api.x.ai/v1
@@ -30,7 +45,14 @@ providers:
   mistral:
     env_key: MISTRAL_API_KEY
     base_url: https://api.mistral.ai/v1
-    model: mistral-small-latest
+    # mistral-small-latest (Mistral Small 4) returns 429 with
+    # x-ratelimit-limit-req-minute: 0 on this Free/Experiment key, i.e. it has no
+    # free quota. Ministral 3 14B is free on the key (30 req/min per headers).
+    model: ministral-14b-latest
+    free_tier: true
+    rate_limit:
+      rpm: 20
+      max_concurrency: 2
   nosana:
     env_key: NOSANA_API_KEY
     base_url: https://inference.nosana.com/v1
@@ -45,6 +67,15 @@ providers:
     optional_auth_env: NOSANA_API_KEY
 
 judge:
-  provider: openai
-  model: gpt-4o-mini
-  # Falls back to heuristic rubric when no judge key is present or in dry-run.
+  # 2026-10-24: Gemini free judge quota exhausted (429 per-day). Re-judged with
+  # Mistral free tier. mistral-small-latest / mistral-medium-latest have
+  # x-ratelimit-limit-req-minute: 0 on this key, so ministral-14b-latest is the
+  # best free Mistral model. LIMITATION: it is also the mistral subject model,
+  # so Mistral grades its own answers.
+  provider: mistral
+  model: ministral-14b-latest
+  max_tokens: 300
+  max_retries: 8
+  no_heuristic_fallback: true
+  rate_limit:
+    rpm: 60   # ~1 req/s; backoff on 429/5xx in judge.py
